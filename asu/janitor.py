@@ -11,7 +11,7 @@ bp = Blueprint("janitor", __name__)
 r = redis.Redis()
 
 
-def download_package_indexes(version: str, arch: str = "x86_64"):
+def get_packages_arch(version: str, arch: str = "x86_64"):
     """Download package in index of a version
 
     This function is used to store all available packages of a version to the
@@ -32,20 +32,72 @@ def download_package_indexes(version: str, arch: str = "x86_64"):
     packages = []
     for source in sources:
         current_app.logger.info(f"Downloading {source}")
-        source_content = (
-            urllib.request.urlopen(f"{base_url}/{source}/Packages").read().decode()
-        )
-        source_packages = re.findall(r"Package: (.+)\n", source_content)
-        current_app.logger.info(f"Found {len(source_packages)} packages")
-        packages.extend(re.findall(r"Package: (.+)\n", source_content))
+        packages.extend(parse_package_index(f"{base_url}/{source}"))
 
     current_app.logger.info(f"Total of {len(packages)} packages found")
 
     r.sadd(f"packages-{version['name']}", *packages)
 
 
-def merge_profiles(version: dict, profiles: list, base_url: str):
+def get_packages_targets(version):
+    targets = list(
+        map(lambda t: (version, t.decode()), r.smembers(f"targets-{version['name']}"))
+    )
+
+    pool = Pool(20)
+    pool.map(get_packages_target, targets)
+
+
+def get_packages_target(version_target: tuple):
+    """Download target packages index and inserts them to Redis
+
+    Args:
+        version_target (tuple): Version and target combined as a tuple so it is
+                                handed over as a single arg.
+    """
+    version, target = version_target
+    current_app.logger.info(f"{version['name']}/{target} downloading packages")
+    target_url = "/".join(
+        [
+            current_app.config["UPSTREAM_URL"],
+            version.get("path"),
+            "targets",
+            target,
+            "packages",
+        ]
+    )
+    r.sadd(f"packages-{version['name']}-{target}", *parse_package_index(target_url))
+
+
+def parse_package_index(url: str) -> list:
+    """Download and parse a package index at given URL and return package names
+
+    Args:
+        url (str): URL to package index
+
+    Returns:
+        list: List of strings containing the found package names
+    """
+    source_content = urllib.request.urlopen(f"{url}/Packages").read().decode()
+    source_packages = re.findall(r"Package: (.+)\n", source_content)
+    current_app.logger.debug(f"{len(source_packages)} packages in {url}")
+    return re.findall(r"Package: (.+)\n", source_content)
+
+
+def merge_profiles(version: dict, profiles: list):
+    """Merge found profiles to single JSON file and insert into Redis database
+
+    The JSON file is useful for web frontends to give them knowledge of which
+    profiles are actually available and the "human readable model name"
+
+    Args:
+        version (dict): Containing all version information as defined in VERSIONS
+        profiles (list): List of parsed profile images
+    """
+    version_url = current_app.config["UPSTREAM_URL"] + "/" + version.get("path")
+    base_url = f"{version_url}/targets"
     profiles_dict = {}
+    targets = set()
     names_json_overview = {}
 
     for profile_info in profiles:
@@ -80,6 +132,9 @@ def merge_profiles(version: dict, profiles: list, base_url: str):
                 "images": profile_info["images"],
             }
 
+            targets.add(profile_info["target"])
+
+    r.sadd(f"targets-{version['name']}", *targets)
     r.hmset(f"profiles-{version['name']}", profiles_dict)
     (current_app.config["JSON_PATH"] / f"names-{version['name']}.json").write_text(
         json.dumps(names_json_overview, sort_keys=True, indent="  ")
@@ -132,7 +187,7 @@ def get_json_files(version: dict):
     pool = Pool(20)
     profiles = pool.map(download_profile, files)
     current_app.logger.info("Done downloading profile json files")
-    merge_profiles(version, profiles, base_url)
+    merge_profiles(version, profiles)
 
 
 @bp.cli.command("init")
@@ -149,5 +204,6 @@ def init():
             continue
 
         current_app.logger.info(f"Setup {version['name']}")
+        get_packages_targets(version)
         get_json_files(version)
-        download_package_indexes(version)
+        get_packages_arch(version)
